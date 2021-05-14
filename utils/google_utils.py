@@ -15,7 +15,7 @@ def attempt_download(weights):
 
     r = 1  # return
     if len(weights) > 0 and not os.path.isfile(weights):
-        d = {'': '',
+        d = {'',
              }
 
         file = Path(weights).name
@@ -24,7 +24,7 @@ def attempt_download(weights):
 
         if not (r == 0 and os.path.exists(weights) and os.path.getsize(weights) > 1E6):  # weights exist and > 1MB
             os.remove(weights) if os.path.exists(weights) else None  # remove partial downloads
-            s = 'curl -L -o %s "storage.googleapis.com/%s"' % (weights, file)
+            s = ''
             r = os.system(s)  # execute, capture return values
 
             # Error check

@@ -55,7 +55,7 @@ class Detect(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, cfg='yolov4.yaml', ch=3, nc=None):  # model, input channels, number of classes
+    def __init__(self, cfg='yolov4-p5.yaml', ch=3, nc=None):  # model, input channels, number of classes
         super(Model, self).__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -75,7 +75,7 @@ class Model(nn.Module):
         # Build strides, anchors
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):
-            s = 128  # 2x min stride
+            s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             m.anchors /= m.stride.view(-1, 1, 1)
             check_anchor_order(m)
@@ -209,6 +209,9 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             if m in [BottleneckCSP, BottleneckCSP2, SPPCSP, VoVCSP, C3]:
                 args.insert(2, n)
                 n = 1
+        elif m in [HarDBlock, HarDBlock2]:
+            c1 = ch[f]
+            args = [c1, *args[:]]
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
@@ -227,13 +230,17 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         print('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
-        ch.append(c2)
+        if m in [HarDBlock, HarDBlock2]:
+            c2 = m_.get_out_ch()
+            ch.append(c2)
+        else:
+            ch.append(c2)
     return nn.Sequential(*layers), sorted(save)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, default='yolov4.yaml', help='model.yaml')
+    parser.add_argument('--cfg', type=str, default='yolov4-p5.yaml', help='model.yaml')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     opt = parser.parse_args()
     opt.cfg = check_file(opt.cfg)  # check file

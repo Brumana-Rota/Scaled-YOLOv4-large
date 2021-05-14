@@ -462,6 +462,7 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     nt = 0  # number of targets
     np = len(p)  # number of outputs
     balance = [4.0, 1.0, 0.4] if np == 3 else [4.0, 1.0, 0.4, 0.1]  # P3-5 or P3-6
+    balance = [4.0, 1.0, 0.5, 0.4, 0.1] if np == 5 else balance
     for i, pi in enumerate(p):  # layer index, layer predictions
         b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
         tobj = torch.zeros_like(pi[..., 0], device=device)  # target obj
@@ -474,8 +475,6 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             # Regression
             pxy = ps[:, :2].sigmoid() * 2. - 0.5
             pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
-            #pxy = torch.sigmoid(ps[:, 0:2])  # pxy = pxy * s - (s - 1) / 2,  s = 1.5  (scale_xy)
-            #pwh = torch.exp(ps[:, 2:4]).clamp(max=1E3) * anchors[i]
             pbox = torch.cat((pxy, pwh), 1).to(device)  # predicted box
             giou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # giou(prediction, target)
             lbox += (1.0 - giou).mean()  # giou loss
@@ -497,7 +496,7 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
     s = 3 / np  # output count scaling
     lbox *= h['giou'] * s
-    lobj *= h['obj'] * s * (1.4 if np == 4 else 1.)
+    lobj *= h['obj'] * s * (1.4 if np >= 4 else 1.)
     lcls *= h['cls'] * s
     bs = tobj.shape[0]  # batch size
 
@@ -506,35 +505,44 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
 
 def build_targets(p, targets, model):
-    nt = targets.shape[0]  # number of anchors, targets
+    # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+    det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+    na, nt = det.na, targets.shape[0]  # number of anchors, targets
     tcls, tbox, indices, anch = [], [], [], []
-    gain = torch.ones(6, device=targets.device)  # normalized to gridspace gain
-    off = torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]], device=targets.device).float()  # overlap offsets
+    gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+    ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+    targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
-    g = 0.5  # offset
-    multi_gpu = is_parallel(model)
-    for i, jj in enumerate(model.module.yolo_layers if multi_gpu else model.yolo_layers):
-        # get number of grid points and anchor vec for this yolo layer
-        anchors = model.module.module_list[jj].anchor_vec if multi_gpu else model.module_list[jj].anchor_vec
-        gain[2:] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
+    g = 0.5  # bias
+    off = torch.tensor([[0, 0],
+                        [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
+                        # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
+                        ], device=targets.device).float() * g  # offsets
+
+    for i in range(det.nl):
+        anchors = det.anchors[i]
+        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
 
         # Match targets to anchors
-        a, t, offsets = [], targets * gain, 0
+        t = targets * gain
         if nt:
-            na = anchors.shape[0]  # number of anchors
-            at = torch.arange(na).view(na, 1).repeat(1, nt)  # anchor tensor, same as .repeat_interleave(nt)
-            r = t[None, :, 4:6] / anchors[:, None]  # wh ratio
+            # Matches
+            r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
             j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
-            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n) = wh_iou(anchors(3,2), gwh(n,2))
-            a, t = at[j], t.repeat(na, 1, 1)[j]  # filter
+            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
+            t = t[j]  # filter
 
-            # overlaps
+            # Offsets
             gxy = t[:, 2:4]  # grid xy
-            z = torch.zeros_like(gxy)
+            gxi = gain[[2, 3]] - gxy  # inverse
             j, k = ((gxy % 1. < g) & (gxy > 1.)).T
-            l, m = ((gxy % 1. > (1 - g)) & (gxy < (gain[[2, 3]] - 1.))).T
-            a, t = torch.cat((a, a[j], a[k], a[l], a[m]), 0), torch.cat((t, t[j], t[k], t[l], t[m]), 0)
-            offsets = torch.cat((z, z[j] + off[0], z[k] + off[1], z[l] + off[2], z[m] + off[3]), 0) * g
+            l, m = ((gxi % 1. < g) & (gxi > 1.)).T
+            j = torch.stack((torch.ones_like(j), j, k, l, m))
+            t = t.repeat((5, 1, 1))[j]
+            offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+        else:
+            t = targets[0]
+            offsets = 0
 
         # Define
         b, c = t[:, :2].long().T  # image, class
@@ -544,8 +552,8 @@ def build_targets(p, targets, model):
         gi, gj = gij.T  # grid xy indices
 
         # Append
-        #indices.append((b, a, gj, gi))  # image, anchor, grid indices
-        indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
+        a = t[:, 6].long()  # anchor indices
+        indices.append((b, a, gj.clamp_(0, gain[3]), gi.clamp_(0, gain[2])))  # image, anchor, grid indices
         tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
         anch.append(anchors[a])  # anchors
         tcls.append(c)  # class
@@ -637,15 +645,203 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, merge=False, 
     return output
 
 
+def intersect(box_a, box_b):
+
+    n = box_a.size(0)
+    A = box_a.size(1)
+    B = box_b.size(1)
+    max_xy = torch.min(box_a[:, :, 2:].unsqueeze(2).expand(n, A, B, 2),
+                       box_b[:, :, 2:].unsqueeze(1).expand(n, A, B, 2))
+    min_xy = torch.max(box_a[:, :, :2].unsqueeze(2).expand(n, A, B, 2),
+                       box_b[:, :, :2].unsqueeze(1).expand(n, A, B, 2))
+    inter = torch.clamp((max_xy - min_xy), min=0)
+    return inter[:, :, :, 0] * inter[:, :, :, 1]
+
+def jaccard(box_a, box_b, iscrowd:bool=False):
+    use_batch = True
+    if box_a.dim() == 2:
+        use_batch = False
+        box_a = box_a[None, ...]
+        box_b = box_b[None, ...]
+
+    inter = intersect(box_a, box_b)
+    area_a = ((box_a[:, :, 2]-box_a[:, :, 0]) *
+              (box_a[:, :, 3]-box_a[:, :, 1])).unsqueeze(2).expand_as(inter)  # [A,B]
+    area_b = ((box_b[:, :, 2]-box_b[:, :, 0]) *
+              (box_b[:, :, 3]-box_b[:, :, 1])).unsqueeze(1).expand_as(inter)  # [A,B]
+    union = area_a + area_b - inter
+    out = inter / area_a if iscrowd else inter / (union + 0.0000001)
+
+    return out if use_batch else out.squeeze(0)
+
+def jaccard_diou(box_a, box_b, iscrowd:bool=False):
+    use_batch = True
+    if box_a.dim() == 2:
+        use_batch = False
+        box_a = box_a[None, ...]
+        box_b = box_b[None, ...]
+
+    inter = intersect(box_a, box_b)
+    area_a = ((box_a[:, :, 2]-box_a[:, :, 0]) *
+              (box_a[:, :, 3]-box_a[:, :, 1])).unsqueeze(2).expand_as(inter)  # [A,B]
+    area_b = ((box_b[:, :, 2]-box_b[:, :, 0]) *
+              (box_b[:, :, 3]-box_b[:, :, 1])).unsqueeze(1).expand_as(inter)  # [A,B]
+    union = area_a + area_b - inter
+    x1 = ((box_a[:, :, 2]+box_a[:, :, 0]) / 2).unsqueeze(2).expand_as(inter)
+    y1 = ((box_a[:, :, 3]+box_a[:, :, 1]) / 2).unsqueeze(2).expand_as(inter)
+    x2 = ((box_b[:, :, 2]+box_b[:, :, 0]) / 2).unsqueeze(1).expand_as(inter)
+    y2 = ((box_b[:, :, 3]+box_b[:, :, 1]) / 2).unsqueeze(1).expand_as(inter)
+
+    t1 = box_a[:, :, 1].unsqueeze(2).expand_as(inter)
+    b1 = box_a[:, :, 3].unsqueeze(2).expand_as(inter)
+    l1 = box_a[:, :, 0].unsqueeze(2).expand_as(inter)
+    r1 = box_a[:, :, 2].unsqueeze(2).expand_as(inter)
+
+    t2 = box_b[:, :, 1].unsqueeze(1).expand_as(inter)
+    b2 = box_b[:, :, 3].unsqueeze(1).expand_as(inter)
+    l2 = box_b[:, :, 0].unsqueeze(1).expand_as(inter)
+    r2 = box_b[:, :, 2].unsqueeze(1).expand_as(inter)
+
+    cr = torch.max(r1, r2)
+    cl = torch.min(l1, l2)
+    ct = torch.min(t1, t2)
+    cb = torch.max(b1, b2)
+    D = (((x2 - x1)**2 + (y2 - y1)**2) / ((cr-cl)**2 + (cb-ct)**2 + 1e-7))
+    out = inter / area_a if iscrowd else inter / (union + 1e-7) - D ** 0.7
+    return out if use_batch else out.squeeze(0)
+
+def box_diou(boxes1, boxes2):
+    # https://github.com/pytorch/vision/blob/master/torchvision/ops/boxes.py
+    """
+    Return intersection-over-union (Jaccard index) of boxes.
+    Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
+    Arguments:
+        boxes1 (Tensor[N, 4])
+        boxes2 (Tensor[M, 4])
+    Returns:
+        iou (Tensor[N, M]): the NxM matrix containing the pairwise
+            IoU values for every element in boxes1 and boxes2
+    """
+
+    def box_area(box):
+        # box = 4xn
+        return (box[2] - box[0]) * (box[3] - box[1])
+
+    area1 = box_area(boxes1.t())
+    area2 = box_area(boxes2.t())
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
+    clt=torch.min(boxes1[:, None, :2], boxes2[:, :2])
+    crb=torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
+    x1=(boxes1[:, None, 0] + boxes1[:, None, 2])/2
+    y1=(boxes1[:, None, 1] + boxes1[:, None, 3])/2
+    x2=(boxes2[:, None, 0] + boxes2[:, None, 2])/2
+    y2=(boxes2[:, None, 1] + boxes2[:, None, 3])/2
+    d=(x1-x2.t())**2 + (y1-y2.t())**2
+    c=((crb-clt)**2).sum(dim=2)
+
+    inter = (rb - lt).clamp(min=0).prod(2)  # [N,M]
+    return inter / (area1[:, None] + area2 - inter) - (d / c)**0.6  # iou = inter / (area1 + area2 - inter)
+
+# For batch mode Cluster-Weighted NMS
+def non_max_suppression2(prediction, conf_thres=0.1, iou_thres=0.6, max_box=1500, merge=False, classes=None, agnostic=False):
+    """Performs Non-Maximum Suppression (NMS) on inference results
+    Returns:
+         detections with shape: nx6 (x1, y1, x2, y2, conf, cls)
+    """
+    if prediction.dtype is torch.float16:
+        prediction = prediction.float()  # to FP32
+
+    nc = prediction[0].shape[1] - 5  # number of classes
+    xc = prediction[..., 4] > conf_thres  # candidates
+
+    # Settings
+    min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
+    max_det = 300  # maximum number of detections per image
+    time_limit = 10.0  # seconds to quit after
+    redundant = True  # require redundant detections
+    multi_label = nc > 1  # multiple labels per box (adds 0.5ms/img)
+
+    t = time.time()
+    output = [None] * prediction.shape[0]   
+    pred1 = (prediction < -1).float()[:,:max_box,:6]    # pred1.size()=[batch, max_box, max_box] denotes boxes without offset by class
+    pred2 = pred1[:,:,:4]+0   # pred2 denotes boxes with offset by class
+    batch_size = prediction.shape[0]   
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        x = x[xc[xi]]  # confidence
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+        # Compute conf
+        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+
+        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+        box = xywh2xyxy(x[:, :4])
+
+        # Detections matrix nx6 (xyxy, conf, cls)
+        if multi_label:
+            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
+        else:  # best class only
+            conf, j = x[:, 5:].max(1, keepdim=True)
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+
+        # Filter by class
+        if classes:
+            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Apply finite constraint
+        # if not torch.isfinite(x).all():
+        #     x = x[torch.isfinite(x).all(1)]
+
+        # If none remain process next image
+        n = x.shape[0]  # number of boxes
+        if not n:
+            continue
+
+        # Sort by confidence
+        x = x[x[:, 4].argsort(descending=True)]
+        c = x[:, 5] * 0 if agnostic else x[:, 5]  # classes
+
+        boxes = (x[:, :4].clone() + c.view(-1, 1) * max_wh)[:max_box]  # boxes (offset by class), scores
+        pred2[xi,:] = torch.cat((boxes, pred2[xi,:]), 0)[:max_box]        # If less than max_box, padding 0.
+        pred1[xi,:] = torch.cat((x[:max_box], pred1[xi,:]), 0)[:max_box]
+
+    # Batch mode Cluster-Weighted NMS
+
+    iou = jaccard_diou(pred2, pred2).triu_(diagonal=1)    # switch to 'jaccard_diou' function for using Cluster-DIoU-NMS
+    B = iou
+    for i in range(200):
+        A=B
+        maxA=A.max(dim=1)[0]
+        E = (maxA<iou_thres).float().unsqueeze(2).expand_as(A)
+        B=iou.mul(E)
+        if A.equal(B)==True:
+            break
+    keep = (maxA <= iou_thres) 
+    weights = (B*(B>0.8) + torch.eye(max_box).cuda().expand(batch_size,max_box,max_box)) * (pred1[:,:,4].reshape((batch_size,1,max_box)))
+    pred1[:,:, :4]=torch.matmul(weights,pred1[:,:,:4]) / weights.sum(2, keepdim=True)   # weighted coordinates
+
+    for jj in range(batch_size):
+        output[jj] = pred1[jj][keep[jj]]
+
+    return output
+
+
 def strip_optimizer(f='weights/best.pt', s=''):  # from utils.utils import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'
     x = torch.load(f, map_location=torch.device('cpu'))
     x['optimizer'] = None
     x['training_results'] = None
     x['epoch'] = -1
-    #x['model'].half()  # to FP16
-    #for p in x['model'].parameters():
-    #    p.requires_grad = False
+    x['model'].half()  # to FP16
+    for p in x['model'].parameters():
+        p.requires_grad = False
     torch.save(x, s or f)
     mb = os.path.getsize(s or f) / 1E6  # filesize
     print('Optimizer stripped from %s,%s %.1fMB' % (f, (' saved as %s,' % s) if s else '', mb))
@@ -1110,7 +1306,7 @@ def plot_study_txt(f='study.txt', x=None):  # from utils.utils import *; plot_st
     ax = ax.ravel()
 
     fig2, ax2 = plt.subplots(1, 1, figsize=(8, 4), tight_layout=True)
-    for f in ['coco_study/study_coco_yolov4%s.txt' % x for x in ['s', 'm', 'l', 'x']]:
+    for f in ['']:
         y = np.loadtxt(f, dtype=np.float32, usecols=[0, 1, 2, 3, 7, 8, 9], ndmin=2).T
         x = np.arange(y.shape[1]) if x is None else np.array(x)
         s = ['P', 'R', 'mAP@.5', 'mAP@.5:.95', 't_inference (ms/img)', 't_NMS (ms/img)', 't_total (ms/img)']

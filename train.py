@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
-from models.models import *
+from models.yolo import Model
 from utils.datasets import create_dataloader
 from utils.general import (
     check_img_size, torch_distributed_zero_first, labels_to_class_weights, plot_labels, check_anchors,
@@ -62,12 +62,15 @@ def train(hyp, opt, device, tb_writer=None):
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Darknet(opt.cfg).to(device)  # create
-        state_dict = {k: v for k, v in ckpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
-        model.load_state_dict(state_dict, strict=False)
+        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc).to(device)  # create
+        exclude = ['anchor'] if opt.cfg else []  # exclude keys
+        state_dict = ckpt['model'].float().state_dict()  # to FP32
+        state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
+        model.load_state_dict(state_dict, strict=False)  # load
         print('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Darknet(opt.cfg).to(device) # create
+        model = Model(opt.cfg, ch=3, nc=nc).to(device)# create
+        #model = model.to(memory_format=torch.channels_last)  # create
 
     # Optimizer
     nbs = 64  # nominal batch size
@@ -75,11 +78,12 @@ def train(hyp, opt, device, tb_writer=None):
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
-    for k, v in dict(model.named_parameters()).items():
+    for k, v in model.named_parameters():
+        v.requires_grad = True
         if '.bias' in k:
             pg2.append(v)  # biases
-        elif 'Conv2d.weight' in k:
-            pg1.append(v)  # apply weight_decay
+        elif '.weight' in k and '.bn' not in k:
+            pg1.append(v)  # apply weight decay
         else:
             pg0.append(v)  # all else
 
@@ -122,7 +126,7 @@ def train(hyp, opt, device, tb_writer=None):
         del ckpt, state_dict
     
     # Image sizes
-    gs = 32 # grid size (max stride)
+    gs = int(max(model.stride))  # grid size (max stride)
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
 
     # DP mode
@@ -175,8 +179,8 @@ def train(hyp, opt, device, tb_writer=None):
             tb_writer.add_histogram('classes', c, 0)
 
         # Check anchors
-        #if not opt.noautoanchor:
-        #    check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
+        if not opt.noautoanchor:
+            check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
 
     # Start training
     t0 = time.time()
@@ -248,8 +252,9 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Autocast
             with amp.autocast(enabled=cuda):
-                # Forward
+                # Forward                
                 pred = model(imgs)
+                #pred = model(imgs.to(memory_format=torch.channels_last))
 
                 # Loss
                 loss, loss_items = compute_loss(pred, targets.to(device), model)  # scaled by batch_size
@@ -295,7 +300,7 @@ def train(hyp, opt, device, tb_writer=None):
         if rank in [-1, 0]:
             # mAP
             if ema is not None:
-                ema.update_attr(model)
+                ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 results, maps, times = test.test(opt.data,
@@ -333,14 +338,14 @@ def train(hyp, opt, device, tb_writer=None):
                     ckpt = {'epoch': epoch,
                             'best_fitness': best_fitness,
                             'training_results': f.read(),
-                            'model': ema.ema.module.state_dict() if hasattr(ema, 'module') else ema.ema.state_dict(),
+                            'model': ema.ema.module if hasattr(ema, 'module') else ema.ema,
                             'optimizer': None if final_epoch else optimizer.state_dict()}
 
                 # Save last, best and delete
                 torch.save(ckpt, last)
-                if epoch >= (epochs-5):
+                if epoch >= (epochs-30):
                     torch.save(ckpt, last.replace('.pt','_{:03d}.pt'.format(epoch)))
-                if (best_fitness == fi) and not final_epoch:
+                if best_fitness == fi:
                     torch.save(ckpt, best)
                 del ckpt
         # end epoch ----------------------------------------------------------------------------------------------------
@@ -354,7 +359,7 @@ def train(hyp, opt, device, tb_writer=None):
             if os.path.exists(f1):
                 os.rename(f1, f2)  # rename
                 ispt = f2.endswith('.pt')  # is *.pt
-                strip_optimizer(f2) if ispt else None  # strip optimizer
+                strip_optimizer(f2, f2.replace('.pt','_strip.pt')) if ispt else None  # strip optimizer
                 os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
         # Finish
         if not opt.evolve:
@@ -368,7 +373,7 @@ def train(hyp, opt, device, tb_writer=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', type=str, default='yolov4.pt', help='initial weights path')
+    parser.add_argument('--weights', type=str, default='yolov4-p5.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='', help='hyperparameters path, i.e. data/hyp.scratch.yaml')
@@ -403,7 +408,7 @@ if __name__ == '__main__':
     if opt.local_rank == -1 or ("RANK" in os.environ and os.environ["RANK"] == "0"):
         check_git_status()
 
-    opt.hyp = opt.hyp or ('data/hyp.scratch.yaml')
+    opt.hyp = opt.hyp or ('data/hyp.finetune.yaml' if opt.weights else 'data/hyp.scratch.yaml')
     opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
     assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
 
